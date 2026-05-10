@@ -1,0 +1,294 @@
+version: '3.8'
+
+# ═══════════════════════════════════════════════════════════════
+# E-Commerce Microservices Stack
+# Services: Flask API, PostgreSQL (primary+replica), MongoDB (3 nodes),
+#           Cassandra (3 nodes), Spark (master+worker), Solr,
+#           Prometheus, Grafana
+# ═══════════════════════════════════════════════════════════════
+
+networks:
+  ecommerce-net:
+    driver: bridge
+
+volumes:
+  pg-primary-data:
+  pg-replica-data:
+  mongo1-data:
+  mongo2-data:
+  mongo3-data:
+  cassandra1-data:
+  cassandra2-data:
+  cassandra3-data:
+  prometheus-data:
+  grafana-data:
+  solr-data:
+
+services:
+
+  # ─────────────────────────────────────────────
+  # FLASK API
+  # ─────────────────────────────────────────────
+  flask-api:
+    build: ./app
+    container_name: flask-api
+    ports:
+      - "5000:5000"
+    environment:
+      POSTGRES_HOST: postgres-primary
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      MONGO_URI: mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0
+      CASSANDRA_HOSTS: cassandra1,cassandra2,cassandra3
+    depends_on:
+      - postgres-primary
+      - mongo1
+      - cassandra1
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # POSTGRESQL - PRIMARY
+  # ─────────────────────────────────────────────
+  postgres-primary:
+    image: postgres:15
+    container_name: postgres-primary
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./db/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # POSTGRESQL - REPLICA (read-only standby)
+  postgres-replica:
+    image: postgres:15
+    container_name: postgres-replica
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      PGUSER: admin
+    volumes:
+      - pg-replica-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - ecommerce-net
+    depends_on:
+      - postgres-primary
+    command: >
+      bash -c "
+        until pg_basebackup -h postgres-primary -U admin -D /var/lib/postgresql/data -Fp -Xs -R -P; do
+          echo 'Waiting for primary to be ready...'; sleep 2;
+        done
+        postgres
+      "
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # MONGODB REPLICA SET (3 nodes)
+  # ─────────────────────────────────────────────
+  mongo1:
+    image: mongo:7
+    container_name: mongo1
+    command: mongod --replSet rs0 --bind_ip_all
+    volumes:
+      - mongo1-data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  mongo2:
+    image: mongo:7
+    container_name: mongo2
+    command: mongod --replSet rs0 --bind_ip_all
+    volumes:
+      - mongo2-data:/data/db
+    ports:
+      - "27018:27017"
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  mongo3:
+    image: mongo:7
+    container_name: mongo3
+    command: mongod --replSet rs0 --bind_ip_all
+    volumes:
+      - mongo3-data:/data/db
+    ports:
+      - "27019:27017"
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # Initializes the MongoDB replica set (runs once and exits)
+  mongo-init:
+    image: mongo:7
+    container_name: mongo-init
+    depends_on:
+      - mongo1
+      - mongo2
+      - mongo3
+    networks:
+      - ecommerce-net
+    volumes:
+      - ./db/mongo/init-replica.js:/init-replica.js
+    command: >
+      bash -c "
+        sleep 10 &&
+        mongosh --host mongo1:27017 /init-replica.js
+      "
+    restart: "no"
+
+  # ─────────────────────────────────────────────
+  # CASSANDRA CLUSTER (3 nodes)
+  # ─────────────────────────────────────────────
+  cassandra1:
+    image: cassandra:4.1
+    container_name: cassandra1
+    environment:
+      CASSANDRA_CLUSTER_NAME: ecommerce-cluster
+      CASSANDRA_SEEDS: cassandra1
+      CASSANDRA_DC: datacenter1
+      HEAP_NEWSIZE: 128M
+      MAX_HEAP_SIZE: 512M
+    volumes:
+      - cassandra1-data:/var/lib/cassandra
+    ports:
+      - "9042:9042"
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  cassandra2:
+    image: cassandra:4.1
+    container_name: cassandra2
+    environment:
+      CASSANDRA_CLUSTER_NAME: ecommerce-cluster
+      CASSANDRA_SEEDS: cassandra1      # Joins via cassandra1 as seed
+      CASSANDRA_DC: datacenter1
+      HEAP_NEWSIZE: 128M
+      MAX_HEAP_SIZE: 512M
+    volumes:
+      - cassandra2-data:/var/lib/cassandra
+    depends_on:
+      - cassandra1
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  cassandra3:
+    image: cassandra:4.1
+    container_name: cassandra3
+    environment:
+      CASSANDRA_CLUSTER_NAME: ecommerce-cluster
+      CASSANDRA_SEEDS: cassandra1
+      CASSANDRA_DC: datacenter1
+      HEAP_NEWSIZE: 128M
+      MAX_HEAP_SIZE: 512M
+    volumes:
+      - cassandra3-data:/var/lib/cassandra
+    depends_on:
+      - cassandra1
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # APACHE SPARK (master + worker)
+  # ─────────────────────────────────────────────
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+    ports:
+      - "8080:8080"     # Spark Web UI
+      - "7077:7077"     # Spark master port
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: spark-worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_WORKER_CORES: 1
+    depends_on:
+      - spark-master
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # APACHE SOLR (search)
+  # ─────────────────────────────────────────────
+  solr:
+    image: solr:9
+    container_name: solr
+    ports:
+      - "8983:8983"     # Solr Admin UI
+    volumes:
+      - solr-data:/var/solr
+    command: >
+      bash -c "
+        docker-entrypoint.sh solr-precreate ecommerce_products &&
+        solr start -f
+      "
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # PROMETHEUS (metrics collection)
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'    # Keep 7 days of metrics
+    networks:
+      - ecommerce-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # GRAFANA (monitoring dashboard)
+  # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_DATASOURCES_DEFAULT_URL: http://prometheus:9090
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - ecommerce-net
+    restart: unless-stopped

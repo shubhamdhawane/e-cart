@@ -1,0 +1,29 @@
+# prometheus.yml
+# Prometheus scrape configuration for the e-commerce stack
+
+global:
+  scrape_interval: 15s          # Scrape every 15 seconds
+  evaluation_interval: 15s      # Evaluate rules every 15 seconds
+
+scrape_configs:
+
+  # Scrape the Flask API's /metrics endpoint
+  - job_name: 'flask-api'
+    static_configs:
+      - targets: ['flask-api:5000']
+    metrics_path: '/metrics'
+
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Scrape PostgreSQL exporter (if added)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # Scrape MongoDB exporter (if added)
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['mongo-exporter:9216']
